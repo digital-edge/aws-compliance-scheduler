@@ -1,0 +1,235 @@
+Description: Compliance Scheduler Stack
+Parameters:
+  RulesetS3Location:
+    Description: Ruleset json S3 Location
+    Type: String
+    Default: "s3://digitaledge-public-artifacts/compliance/rulesets/pci.json"
+Resources:
+
+  SchedulerLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+          from datetime import date, datetime
+
+          config = boto3.client('config')
+          s3 = boto3.resource('s3')
+          sts = boto3.client('sts')
+
+          os.environ['ruleset']
+
+          ruleset_file = "s3://digitaledge-public-artifacts/compliance/rulesets/pci.json"
+
+          def mark_config_rule_as_noncompliant(config_rule_name):
+            
+            describe_compliance_by_config_rule_response = config.describe_compliance_by_config_rule(ConfigRuleNames=[config_rule_name])
+            
+            if describe_compliance_by_config_rule_response['ComplianceByConfigRules'][0]['Compliance']['ComplianceType'] == 'INSUFFICIENT_DATA':
+
+              print(f'Marking {config_rule_name} as non compliant')
+              
+              put_external_evaluation_response = config.put_external_evaluation(
+                  ConfigRuleName=config_rule_name,
+                  ExternalEvaluation={
+                      'ComplianceResourceType': 'AWS::::Account',
+                      'ComplianceResourceId': .sts.get_caller_identity().get('Account'),
+                      'ComplianceType': 'NON_COMPLIANT',
+                      'Annotation': 'setting to non compliant',
+                      'OrderingTimestamp': datetime.now()
+                      }
+              )
+
+          def split_s3_path(s3_path):
+          
+              path_parts=s3_path.replace("s3://","").split("/")
+              bucket=path_parts.pop(0)
+              key="/".join(path_parts)
+              
+              return bucket, key
+
+          def lambda_handler(event, context):
+
+              s3_bucket, s3_key = split_s3_path(ruleset_file)
+              print(f'Ruleset S3 bucket: {s3_bucket}')
+              print(f'Ruleset S3 key: {s3_key}')
+              content_object = s3.Object(s3_bucket, s3_key)
+              file_content = content_object.get()['Body'].read().decode('utf-8')
+              ruleset = json.loads(file_content)
+            
+              if 'Name' not in ruleset.keys() or 'Rules' not in ruleset.keys():
+                print('Error: Invalid ruleset json')
+
+              ruleset_name = ruleset['Name']
+
+              print(f'Found ruleset name: {ruleset_name}')
+
+              yaml_template = 'Resources:\n'
+
+              year = date.today().year
+              month = date.today().month
+              day = date.today().day
+              
+              #day = 1
+              #month = 1
+
+              current_date = f'{year}{month:02}{day:02}'
+              current_date_with_dashes = f'{year}-{month:02}-{day:02}'
+              
+              conformance_pack_name = f"{ruleset_name}-process-rules-{current_date_with_dashes}"
+              
+              print('gerating_new_template')
+
+              for rule in ruleset['Rules']:
+              
+                  if rule['Frequency'] == "every 12 months":
+                    if month != 1: continue
+                  
+                  elif rule['Frequency'] == "every 6 months":
+                    if month not in (1,7): continue
+                  
+                  elif rule['Frequency'] == "every 3 months":
+                    if month not in (1,4,7,10): continue
+
+                  elif rule['Frequency'] == "every month":
+                    pass           
+                  
+                  else:
+                    print('Unknown Frequency: ' + rule['Frequency'] +', skipping ')
+                    continue
+
+                  rule_name = rule['Description'][0:60].lower().replace(':',' ').replace('.',' ').replace(',',' ').replace('\n',' ').replace(' ','-').replace('--','-')
+                  if rule_name[-1]=='-': rule_name = rule_name[:-1]
+
+                  rule_description = rule['Description'][0:251]
+                  if len(rule['Description'])>251:
+                      rule_description += '...'
+                  rule_description = rule_description.replace("\n","\n    ")
+
+                  yaml_template += f' CheckNo{rule["Number"]}AsOf{current_date}:\n'
+                  yaml_template += f'  Type: AWS::Config::ConfigRule\n'
+                  yaml_template += f'  Properties:\n'
+                  yaml_template += f'   ConfigRuleName: "{rule_name}-{current_date_with_dashes}"\n'
+                  yaml_template += f'   Description: |\n'
+                  yaml_template += f'    {rule_description}\n'
+                  yaml_template += f'   Source:\n'
+                  yaml_template += f'    SourceIdentifier: AWS_CONFIG_PROCESS_CHECK\n'
+                  yaml_template += f'    Owner: AWS\n'
+                  
+              yaml_template += '\n# the end \n'
+
+              print('Creating conformance pack')
+
+              put_conformance_pack_response = config.put_conformance_pack(
+                  ConformancePackName=conformance_pack_name,
+                  TemplateBody=yaml_template
+              )    
+
+              print(put_conformance_pack_response)
+
+              print('Check conformance pack status')
+              describe_conformance_pack_status_response = config.describe_conformance_pack_status(ConformancePackNames=[conformance_pack_name])
+              status = describe_conformance_pack_status_response['ConformancePackStatusDetails'][0]['ConformancePackState']
+
+              print(f'Status: {status}')
+
+              while status != 'CREATE_COMPLETE':
+              
+                time.sleep(10)
+
+                print('Check conformance pack status')
+                describe_conformance_pack_status_response = config.describe_conformance_pack_status(ConformancePackNames=[conformance_pack_name])
+                status = describe_conformance_pack_status_response['ConformancePackStatusDetails'][0]['ConformancePackState']
+                print(f'Status: {status}')
+                
+              if status == 'CREATE_FAILED':
+                print('Failed to create stack, exiting')
+                return 
+
+              describe_config_rules_response = config.describe_config_rules()
+              
+              for config_rule in describe_config_rules_response['ConfigRules']:
+                if config_rule['Source']['SourceIdentifier'] == 'AWS_CONFIG_PROCESS_CHECK':
+                  mark_config_rule_as_noncompliant(config_rule['ConfigRuleName'])
+                  
+              while 'NextToken' in describe_config_rules_response:
+                describe_config_rules_response = config.describe_config_rules(NextToken=describe_config_rules_response['NextToken'])  
+                for config_rule in describe_config_rules_response['ConfigRules']:
+                  if config_rule['Source']['SourceIdentifier'] == 'AWS_CONFIG_PROCESS_CHECK':
+                    mark_config_rule_as_noncompliant(config_rule['ConfigRuleName'])
+
+      Environment:
+        Variables:
+          RulesetS3Location: !Ref RulesetS3Location
+
+
+      Description: 'Runs on schedule creates compliance rulesets'
+      MemorySize: 128
+      Timeout: 120
+      Role: !GetAtt SchedulerLambdaRole.Arn
+
+  SchedulerLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+      - PolicyName: lambda-policy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Action:
+              - cloudwatch:PutMetricAlarm
+              - cloudwatch:ListMetrics
+              - cloudwatch:PutDashboard
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              Resource: '*'
+              Effect: Allow
+            - Action:
+              - config:PutEvaluations
+              - config:DescribeConformancePacks
+              - config:DescribeConformancePackStatus
+              - config:PutConformancePack
+              - config:DescribeConfigRules
+              - config:DescribeComplianceByConfigRule
+              - config:PutExternalEvaluation
+              Resource: '*'
+              Effect: Allow              
+
+
+
+  SchedulerLambdaScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Triggers EnvAlerts Lambda every hour'
+      ScheduleExpression: cron(0 0 1 * ? *)
+      State: ENABLED
+      Targets:
+        - Id: SchedulerLambda1
+          Arn: !GetAtt SchedulerLambda.Arn
+
+
+  SchedulerLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SchedulerLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SchedulerLambdaScheduledRule.Arn
+
